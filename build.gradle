@@ -1,0 +1,315 @@
+import com.amazonaws.regions.Region
+import com.amazonaws.regions.Regions
+import com.amazonaws.services.apigateway.AmazonApiGatewayClient
+import com.amazonaws.services.apigateway.model.*
+import com.amazonaws.services.lambda.AWSLambdaClient
+import com.amazonaws.services.lambda.model.*
+import groovy.json.JsonOutput
+
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
+
+group 'com.bytekast'
+version '1.0-SNAPSHOT'
+
+apply plugin: 'groovy'
+apply plugin: 'java'
+apply plugin: 'jacoco'
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    itestCompile.extendsFrom testCompile
+    itestRuntime.extendsFrom testRuntime
+}
+
+sourceSets {
+    itest {
+        compileClasspath += main.output + test.output
+        runtimeClasspath += main.output + test.output
+
+        groovy.srcDir file('src/test-integration/groovy')
+    }
+
+    // Add integration test resources to classpath when running integration tests from IntelliJ
+    test {
+        resources.srcDir file('src/test-integration/resources')
+    }
+}
+
+dependencies {
+    compile 'org.codehaus.groovy:groovy-all:2.4.6'
+    compile 'com.amazonaws:aws-java-sdk:1.10.74'
+    compile 'com.amazonaws:aws-lambda-java-core:1.1.0'
+    compile 'com.amazonaws:aws-lambda-java-log4j:1.0.0'
+    compile 'com.amazonaws:aws-java-sdk-api-gateway:1.10.74'
+    compile 'org.codehaus.groovy.modules.http-builder:http-builder:0.7.1'
+    compile 'org.apache.httpcomponents:httpclient:4.5.2'
+    compile 'commons-codec:commons-codec:1.4'
+    compile 'org.postgresql:postgresql:9.3-1101-jdbc41'
+    compile 'commons-lang:commons-lang:2.6'
+    compile 'org.codehaus.gpars:gpars:1.2.1'
+    compile 'log4j:log4j:1.2.17'
+
+    testCompile group: 'junit', name: 'junit', version: '4.11'
+}
+
+test {
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
+
+task itest(type: Test) {
+    testClassesDir = sourceSets.itest.output.classesDir
+    classpath = sourceSets.itest.runtimeClasspath
+
+    jacoco {
+        append = true
+        destinationFile = file("$buildDir/jacoco/test.exec")
+        classDumpFile = file("$buildDir/classes/itest")
+    }
+
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
+
+jacocoTestReport {
+    dependsOn tasks.test, tasks.itest
+}
+
+
+task buildZip(type: Zip) {
+    dependsOn jacocoTestReport
+    from compileJava
+    from processResources
+    into('lib') {
+        from configurations.runtime
+    }
+}
+
+build.dependsOn buildZip
+
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.amazonaws:aws-java-sdk:1.10.74'
+        classpath 'com.amazonaws:aws-lambda-java-core:1.1.0'
+        classpath 'com.amazonaws:aws-java-sdk-api-gateway:1.10.74'
+    }
+}
+
+task 'lambda-versions' << {
+    lambda { AWSLambdaClient lambdaClient ->
+        def req = new ListVersionsByFunctionRequest().withFunctionName(getFunction())
+        lambdaClient.listVersionsByFunction(req)?.getVersions()?.each {
+            println JsonOutput.prettyPrint(JsonOutput.toJson(it))
+        }
+    }
+}
+
+task 'lambda-aliases' << {
+    lambda { AWSLambdaClient lambdaClient ->
+        def req = new ListAliasesRequest().withFunctionName(getFunction())
+        lambdaClient.listAliases(req)?.getAliases()?.each {
+            println JsonOutput.prettyPrint(JsonOutput.toJson(it))
+        }
+    }
+}
+
+task 'lambda-deploy' << {
+    lambda { AWSLambdaClient lambdaClient ->
+
+        RandomAccessFile raf = new RandomAccessFile(buildZip.archivePath, "r");
+        FileChannel channel = raf.getChannel()
+        MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+        buffer.load();
+
+        println "Deploying ${buildZip.archivePath}..."
+        def req = new UpdateFunctionCodeRequest()
+                .withFunctionName(getFunction())
+                .withZipFile(buffer)
+                .withPublish(getEnv() in ['STG', 'PROD'] ? true : getPublishFlag())
+        def res = lambdaClient.updateFunctionCode(req);
+        println "Update Lambda function requested: ${JsonOutput.prettyPrint(JsonOutput.toJson(res))}"
+    }
+}
+
+task 'lambda-publish-version' << {
+    lambda { AWSLambdaClient lambdaClient ->
+        def req = new PublishVersionRequest().withFunctionName(getFunction()).withDescription(getDescription())
+        def res = lambdaClient.publishVersion(req)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+    }
+}
+
+task 'lambda-release' << {
+    lambda { AWSLambdaClient lambdaClient ->
+
+        def req = new UpdateAliasRequest()
+                .withName('DEPLOYED')
+                .withFunctionName(getFunction())
+                .withFunctionVersion(getFuncVersion())
+                .withDescription(getDescription())
+        def res = lambdaClient.updateAlias(req)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+    }
+}
+
+task 'apigateway-list-stages' << {
+    apigateway { AmazonApiGatewayClient apiGatewayClient ->
+        def req = new GetStagesRequest().withRestApiId(getRestApiId())
+        def res = apiGatewayClient.getStages(req)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res.item))
+    }
+}
+
+task 'apigateway-list-deployments' << {
+    apigateway { AmazonApiGatewayClient apiGatewayClient ->
+        def limit = project.hasProperty('limit') ? project.property('limit')?.toInteger() : 5
+        def req = new GetDeploymentsRequest().withRestApiId(getRestApiId()).withLimit(limit)
+        def res = apiGatewayClient.getDeployments(req)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res.items))
+    }
+}
+
+task 'apigateway-export' << {
+    apigateway { AmazonApiGatewayClient apiGatewayClient ->
+
+        def req = new GetExportRequest()
+                .withRestApiId(getRestApiId())
+                .withExportType('swagger')
+                .withParameters(['extensions': 'integrations'])
+                .withStageName(getStage())
+        def res = apiGatewayClient.getExport(req)
+        def text = new String(res.body.array(), "UTF-8");
+        new File("${sourceSets.main.resources.srcDirs[0]}/conf/apigateway.${getStage()}.json").write(text)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+    }
+}
+
+task 'apigateway-import' << {
+    apigateway { AmazonApiGatewayClient apiGatewayClient ->
+
+        def apiDefinitionPath = "${sourceSets.main.resources.srcDirs[0]}/conf/apigateway.json"
+        RandomAccessFile raf = new RandomAccessFile(apiDefinitionPath, "r");
+        FileChannel channel = raf.getChannel()
+        MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size());
+        buffer.load();
+
+        def req = new PutRestApiRequest()
+                .withRestApiId(getRestApiId())
+                .withMode(PutMode.Overwrite)
+                .withFailOnWarnings(true)
+                .withBody(buffer)
+        def res = apiGatewayClient.putRestApi(req)
+        println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+    }
+}
+
+task 'apigateway-deploy' << {
+    apigateway { AmazonApiGatewayClient apiGatewayClient ->
+
+        // if deploymentId is provided, update stage with deployment id. otherwise, create a new deployment
+        def deploymentId = project.hasProperty('deploymentId') ? project.property('deploymentId')?.trim() : null
+        if (deploymentId) {
+            def patchOperation = new PatchOperation()
+                    .withPath('/deploymentId')
+                    .withOp('replace')
+                    .withValue(deploymentId)
+            def req = new UpdateStageRequest()
+                    .withRestApiId(getRestApiId())
+                    .withStageName(getStage())
+                    .withPatchOperations([patchOperation])
+            def res = apiGatewayClient.updateStage(req)
+            println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+
+        } else {
+            if (!project.hasProperty('desc')) {
+                throw new GradleException("You must provide a description: Ex. -Pdesc='Some Description' ")
+            }
+
+            def req = new CreateDeploymentRequest()
+                    .withRestApiId(getRestApiId())
+                    .withStageName(getStage())
+                    .withDescription(project.property('desc'))
+            def res = apiGatewayClient.createDeployment(req)
+            println JsonOutput.prettyPrint(JsonOutput.toJson(res))
+        }
+    }
+}
+
+void lambda(Closure closure) {
+    AWSLambdaClient lambdaClient = new AWSLambdaClient()
+    lambdaClient.setRegion(Region.getRegion(Regions.US_EAST_1))
+    try {
+        closure(lambdaClient)
+    }
+    catch (e) {
+        println e.getMessage()
+        throw e
+    }
+    finally {
+        lambdaClient.shutdown()
+    }
+}
+
+void apigateway(Closure closure) {
+    AmazonApiGatewayClient apiGatewayClient = new AmazonApiGatewayClient()
+    apiGatewayClient.setRegion(Region.getRegion(Regions.US_EAST_1))
+    try {
+        closure(apiGatewayClient)
+    }
+    catch (e) {
+        println e.getMessage()
+        throw e
+    }
+    finally {
+        apiGatewayClient.shutdown()
+    }
+}
+
+def getPublishFlag() {
+    project.hasProperty('publish') ? project.property('publish').toBoolean() : false
+}
+
+def getFuncVersion() {
+    project.hasProperty('functionVersion') ? project.property('functionVersion') : '$LATEST'
+}
+
+def getEnv() {
+    project.hasProperty('env') ? project.property('env')?.toUpperCase()?.trim() : 'DEV'
+}
+
+def getDescription() {
+    project.hasProperty('desc') ? project.property('desc')?.trim() : buildZip.archiveName
+}
+
+
+def getFunction() {
+    switch (getEnv()) {
+        case 'DEV': return 'dev-api-router'
+        case 'STG': return 'stg-api-router'
+        case 'PROD': return 'prod-api-router'
+        default: 'dev-api-router'
+    }
+}
+
+def getStage() {
+    switch (getEnv()) {
+        case 'DEV': return 'dev'
+        case 'STG': return 'stg'
+        case 'PROD': return 'prod'
+        default: 'dev'
+    }
+}
+
+def getRestApiId() {
+    'XXXXXXXX' // replace
+}
